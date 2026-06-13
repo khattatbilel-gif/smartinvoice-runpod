@@ -32,15 +32,9 @@ except Exception as e:
 # ─────────────────────────────────────────────
 print("[SmartInvoice] Loading Qwen2.5-VL-7B model...", flush=True)
 
-bnb_cfg = BitsAndBytesConfig(
-    load_in_4bit=True,
-    bnb_4bit_quant_type="nf4",
-    bnb_4bit_compute_dtype=torch.bfloat16,
-)
-
 model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
     "Qwen/Qwen2.5-VL-7B-Instruct",
-    quantization_config=bnb_cfg,
+    torch_dtype=torch.float16,
     device_map="auto",
 )
 processor = AutoProcessor.from_pretrained(
