@@ -3,7 +3,9 @@ print("HELLO FROM PYTHON", flush=True)
 
 import torch
 print(f"torch OK: {torch.__version__}", flush=True)
-print(f"CUDA available: {torch.cuda.is_available()}", flush=True)
+
+from transformers import Qwen2_5_VLForConditionalGeneration, AutoProcessor
+print("transformers OK", flush=True)
 
 import runpod
 
