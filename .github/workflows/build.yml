@@ -28,4 +28,4 @@ jobs:
           push: true
           tags: |
             ghcr.io/khattatbilel-gif/smartinvoice-qwen:latest
-            ghcr.io/khattatbilel-gif/smartinvoice-qwen:v5
+            ghcr.io/khattatbilel-gif/smartinvoice-qwen:v6
