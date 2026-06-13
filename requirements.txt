@@ -1,5 +1,1 @@
-runpod>=1.6.0
-transformers>=4.45.0
-accelerate>=0.30.0
-Pillow>=10.0.0
-qwen-vl-utils>=0.0.8
+# dependencies installed directly in Dockerfile
