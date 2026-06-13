@@ -1,25 +1,36 @@
 """
 SmartInvoice — RunPod Serverless Handler
-Wraps Qwen3-VL-8B-Instruct v6 pipeline for production invoice extraction.
+Wraps Qwen2.5-VL-7B-Instruct v6 pipeline for production invoice extraction.
 """
 
-import runpod
-import base64
-import json
-import re
-import torch
-from io import BytesIO
-from PIL import Image
-from transformers import (
-    Qwen2_5_VLForConditionalGeneration,
-    AutoProcessor,
-    BitsAndBytesConfig
-)
+import sys
+print("[SmartInvoice] Starting...", flush=True)
+
+try:
+    import runpod
+    print("[SmartInvoice] runpod OK", flush=True)
+    import base64
+    import json
+    import re
+    import torch
+    print("[SmartInvoice] torch OK", flush=True)
+    from io import BytesIO
+    from PIL import Image
+    print("[SmartInvoice] PIL OK", flush=True)
+    from transformers import (
+        Qwen2_5_VLForConditionalGeneration,
+        AutoProcessor,
+        BitsAndBytesConfig
+    )
+    print("[SmartInvoice] transformers OK", flush=True)
+except Exception as e:
+    print(f"[SmartInvoice] IMPORT ERROR: {e}", flush=True)
+    sys.exit(1)
 
 # ─────────────────────────────────────────────
 # 1. MODEL LOAD  (runs once at cold start)
 # ─────────────────────────────────────────────
-print("[SmartInvoice] Loading Qwen3-VL-8B model...")
+print("[SmartInvoice] Loading Qwen2.5-VL-7B model...", flush=True)
 
 bnb_cfg = BitsAndBytesConfig(
     load_in_4bit=True,
@@ -28,7 +39,7 @@ bnb_cfg = BitsAndBytesConfig(
 )
 
 model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-    "Qwen/Qwen2.5-VL-7B-Instruct",          # swap to Qwen3 when available on HF
+    "Qwen/Qwen2.5-VL-7B-Instruct",
     quantization_config=bnb_cfg,
     device_map="auto",
 )
@@ -37,10 +48,10 @@ processor = AutoProcessor.from_pretrained(
     max_pixels=1280 * 28 * 28,
 )
 
-print("[SmartInvoice] Model ready.")
+print("[SmartInvoice] Model ready.", flush=True)
 
 # ─────────────────────────────────────────────
-# 2. V6 PROMPT  (every rule earned in production)
+# 2. V6 PROMPT
 # ─────────────────────────────────────────────
 SCHEMA = """Extract exactly these 25 fields from this Tunisian invoice image and return FLAT JSON only.
 
@@ -88,7 +99,7 @@ CRITICAL RULES:
 
 
 # ─────────────────────────────────────────────
-# 3. PIPELINE FUNCTIONS  (v6 post-processing)
+# 3. PIPELINE FUNCTIONS
 # ─────────────────────────────────────────────
 
 def extract(image: Image.Image) -> dict | None:
@@ -110,7 +121,6 @@ def extract(image: Image.Image) -> dict | None:
 
 
 def flatten_nested(p: dict) -> dict:
-    """Handles Qwen grouping fields under SUPPLIER/CLIENT/TOTALS/LINE_ITEMS."""
     if not isinstance(p, dict):
         return p
     flat = {}
@@ -140,7 +150,6 @@ REF_ROW = re.compile(
 
 
 def _safe_norm_num(v):
-    """Parse Tunisian number format safely. Preserves 3-decimal millime precision."""
     if v is None or v == "":
         return v
     s = str(v).strip()
@@ -166,23 +175,15 @@ def _safe_norm_num(v):
 def post_process(p: dict) -> dict:
     if not isinstance(p, dict):
         return p
-
-    # Normalize scalar number fields
     for field in ("total_ht", "remise", "tva", "timbre", "total_ttc",
                   "prix_unit", "montant_ht"):
         if field in p and not isinstance(p[field], list):
             p[field] = _safe_norm_num(p[field])
-
-    # Normalize list number fields
     for field in ("prix_unit", "montant_ht", "quantite"):
         if isinstance(p.get(field), list):
             p[field] = [_safe_norm_num(x) for x in p[field]]
-
-    # Strip trailing names from telephone
     if p.get("telephone"):
         p["telephone"] = re.split(r"\s+[A-Za-zÀ-ÿ]", str(p["telephone"]))[0].strip()
-
-    # Filter reference rows from line items
     if isinstance(p.get("designation"), list):
         keep_indices = [
             i for i, d in enumerate(p["designation"])
@@ -191,7 +192,6 @@ def post_process(p: dict) -> dict:
         for field in ("designation", "quantite", "prix_unit", "montant_ht"):
             if isinstance(p.get(field), list):
                 p[field] = [p[field][i] for i in keep_indices if i < len(p[field])]
-
     return p
 
 
@@ -206,49 +206,33 @@ def _to_float(v) -> float | None:
 
 def validate(p: dict) -> tuple[bool, list[str]]:
     issues = []
-
-    # Critical fields must be present
     for f in ("client", "numero_facture", "date", "total_ttc"):
         if not p.get(f):
             issues.append(f"missing critical field: {f}")
-
     ht  = _to_float(p.get("total_ht"))
     rem = _to_float(p.get("remise")) or 0.0
     tva = _to_float(p.get("tva"))
     tmb = _to_float(p.get("timbre")) or 0.0
     ttc = _to_float(p.get("total_ttc"))
-
-    # Math check
     if ht and tva and ttc:
         expected = ht - rem + tva + tmb
         if abs(expected - ttc) > 1.0:
             issues.append(f"math mismatch: {ht}-{rem}+{tva}+{tmb}={expected:.3f} ≠ ttc={ttc}")
-
-    # Magnitude sanity (Tunisian comma-as-decimal misread catches)
     for label, val in [("total_ht", ht), ("total_ttc", ttc), ("tva", tva)]:
         if val and val >= 1_000_000:
             issues.append(f"magnitude suspect: {label}={val} (≥1M, likely 1000x misread)")
     if tmb and tmb >= 100:
         issues.append(f"timbre={tmb} suspicious (≥100)")
-
-    # rc_mf == tva_num collision
     rc, tn = (p.get("rc_mf") or "").strip(), (p.get("tva_num") or "").strip()
     if rc and tn and rc == tn:
         issues.append("rc_mf identical to tva_num — likely a swap")
-
-    # tva equals total_ttc (proforma misread)
     if tva and ttc and abs(tva - ttc) < 1.0:
         issues.append(f"tva ({tva}) equals total_ttc ({ttc}) — likely misread")
-
-    # tva > total_ht (impossible)
     if tva and ht and tva > ht:
         issues.append(f"tva ({tva}) > total_ht ({ht}) — suspicious")
-
-    # Line-item list length mismatch
     lens = [len(p.get(f, [])) for f in ("designation", "quantite", "prix_unit", "montant_ht")]
     if len(set(lens)) > 1:
         issues.append(f"line-item list lengths mismatch: {lens}")
-
     return (len(issues) == 0), issues
 
 
@@ -267,33 +251,15 @@ def process_invoice(image: Image.Image) -> dict:
 # ─────────────────────────────────────────────
 
 def handler(job: dict) -> dict:
-    """
-    Expected input:
-      {
-        "input": {
-          "image_base64": "<base64-encoded PNG or JPEG>"
-        }
-      }
-    Returns:
-      {
-        "data": { ...25 fields... },
-        "auto_accept": true/false,
-        "issues": [ ...list of validation issues... ]
-      }
-    """
     try:
         job_input = job.get("input", {})
         image_b64 = job_input.get("image_base64")
-
         if not image_b64:
             return {"error": "Missing 'image_base64' in input"}
-
         image_bytes = base64.b64decode(image_b64)
         image = Image.open(BytesIO(image_bytes)).convert("RGB")
-
         result = process_invoice(image)
         return result
-
     except Exception as e:
         return {"error": str(e)}
 
