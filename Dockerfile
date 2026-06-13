@@ -1,16 +1,15 @@
 FROM runpod/pytorch:2.2.0-py3.10-cuda12.1.1-devel-ubuntu22.04
 WORKDIR /app
 
-# Pin CUDA torch BEFORE qwen-vl-utils can overwrite it
+# Install everything EXCEPT torch and qwen-vl-utils first
 RUN pip install --no-cache-dir \
-    torch==2.2.0+cu121 \
-    torchvision==0.17.0+cu121 \
-    --extra-index-url https://download.pytorch.org/whl/cu121
+    runpod>=1.6.0 \
+    transformers>=4.45.0 \
+    accelerate>=0.30.0 \
+    Pillow>=10.0.0
 
-# Install remaining deps (qwen-vl-utils won't overwrite torch now)
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt --no-deps qwen-vl-utils
-RUN pip install --no-cache-dir qwen-vl-utils --no-deps
+# Install qwen-vl-utils WITHOUT its dependencies (prevents torch overwrite)
+RUN pip install --no-cache-dir --no-deps qwen-vl-utils>=0.0.8
 
 COPY handler.py .
 ENV PYTHONUNBUFFERED=1
