@@ -1,4 +1,5 @@
 import sys
+import traceback
 print("HELLO FROM PYTHON", flush=True)
 
 import torch
@@ -12,9 +13,10 @@ print("runpod imported OK", flush=True)
 
 model = None
 processor = None
+load_error = None
 
 def load_model():
-    global model, processor
+    global model, processor, load_error
     print("Loading model...", flush=True)
     try:
         model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
@@ -28,11 +30,16 @@ def load_model():
         )
         print("Model ready!", flush=True)
     except Exception as e:
-        print(f"Model loading FAILED: {e}", flush=True)
+        load_error = traceback.format_exc()
+        print(f"Model loading FAILED: {load_error}", flush=True)
 
 load_model()
 
 def handler(job):
-    return {"status": "ok", "model_loaded": model is not None}
+    return {
+        "status": "ok",
+        "model_loaded": model is not None,
+        "error": load_error
+    }
 
 runpod.serverless.start({"handler": handler})
