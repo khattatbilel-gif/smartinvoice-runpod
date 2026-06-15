@@ -1,226 +1,235 @@
-"""
-SmartInvoice — RunPod Serverless Handler v6
-"""
-import sys
-import traceback
-print("[SmartInvoice] Starting...", flush=True)
+# SmartInvoice — RunPod Custom Handler
+# Uses transformers directly (same as Kaggle) — no vLLM, no batch size limits.
 
+import os, re, json, traceback
 import torch
-print(f"[SmartInvoice] torch OK: {torch.__version__}, CUDA: {torch.cuda.is_available()}", flush=True)
-
-from transformers import Qwen2_5_VLForConditionalGeneration, AutoProcessor
-print("[SmartInvoice] transformers OK", flush=True)
-
-import base64
-import json
-import re
-from io import BytesIO
 from PIL import Image
+import base64
+import io
 import runpod
 
-print("[SmartInvoice] Loading Qwen2.5-VL-7B model...", flush=True)
-model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-    "Qwen/Qwen2.5-VL-7B-Instruct",
-    torch_dtype=torch.float16,
-    device_map="auto",
-)
-processor = AutoProcessor.from_pretrained(
-    "Qwen/Qwen2.5-VL-7B-Instruct",
-    max_pixels=1280 * 28 * 28,
-)
-print("[SmartInvoice] Model ready.", flush=True)
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
-SCHEMA = """Extract exactly these 25 fields from this Tunisian invoice image and return FLAT JSON only.
+# ─── Model loading ───────────────────────────────────────────────────────────
+print("Loading model...")
+MODEL = "Qwen/Qwen2.5-VL-7B-Instruct"
 
-SUPPLIER INFO (top/header of document):
-- societe: supplier company name
-- adresse: supplier address
-- telephone: supplier phone number (digits only, strip trailing names)
-- rc_mf: supplier fiscal IDs — MF first then space then RC (never Code Douane)
+try:
+    from transformers import Qwen2_5_VLForConditionalGeneration, AutoProcessor
 
-CLIENT INFO (client block in document):
-- client: client company name (NOT the contact person after "A l'attention de")
-- adresse_client: client address
-- tva_num: client TVA/fiscal number from client block (MF or TVA N° in client zone)
+    processor = AutoProcessor.from_pretrained(
+        MODEL,
+        max_pixels=1280 * 28 * 28,
+        cache_dir=os.environ.get("HF_HOME", None)
+    )
+    model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+        MODEL,
+        torch_dtype=torch.float16,
+        device_map="auto",
+        cache_dir=os.environ.get("HF_HOME", None)
+    )
+    print("Model loaded successfully.")
+    LOAD_ERROR = None
+except Exception:
+    LOAD_ERROR = traceback.format_exc()
+    print("Model load FAILED:", LOAD_ERROR)
+    model = None
+    processor = None
 
-DOCUMENT HEADER:
-- numero_facture: invoice number (FACTURE N°, Facture Pro Forma N°, FACTURE MAGASINAGE N°)
-- date: invoice date (DD/MM/YYYY)
-- reference: single document-level reference only (NOT per-line BL numbers)
+# ─── Prompt ──────────────────────────────────────────────────────────────────
+SCHEMA = """You extract structured data from Tunisian business invoices (French + Arabic).
+Return ONLY a valid JSON object — no prose, no markdown.
+Output a FLAT JSON object with the exact field names listed below — DO NOT nest fields
+under groups like "SUPPLIER" or "CLIENT" or "TOTALS". All fields go at the top level.
+For every field, output VALUES only, never label text.
+Use "" if a field is genuinely absent from the invoice. Never guess.
 
-TOTALS (always money amounts in Tunisian Dinars):
-- total_ht: total before tax
-- remise: discount amount (0 if none)
-- tva: TVA tax amount in dinars — NEVER a percentage
-- timbre: fiscal stamp (usually 1,000)
-- total_ttc: final total including all taxes
-- montant_lettres: total in words (empty string "" for proformas)
+TUNISIAN NUMBER FORMAT (READ THIS CAREFULLY):
+Tunisian invoices use COMMA as the decimal separator and SPACE (or nothing) as thousands separator.
+  "323,500"     means 323 dinars and 500 millimes — NOT three hundred thousand
+  "1 234,567"   means 1234 dinars and 567 millimes — NOT one million
+  "15 117,154"  means 15117 dinars and 154 millimes
+  "1,000"       means 1 dinar — the timbre is always 1,000 (= 1 dinar)
+Most Tunisian invoice totals are between 10 dinars and 100,000 dinars.
+Output numbers EXACTLY as written on the invoice (keep the comma).
 
-LINE ITEMS — four parallel lists of EQUAL length:
-- designation[]: product/service description
+FIELDS (all at the TOP level of the JSON):
+
+SUPPLIER info (top of invoice or footer):
+- societe: company name
+- adresse: supplier postal address
+- telephone: digits and standard separators only, strip trailing names or labels
+- email: supplier email
+- rc_mf: supplier fiscal identifiers from footer. Format: "<MF> <RC>" with single space. NEVER from client block.
+- rib_banque: supplier bank account (RIB / Compte Bancaire / IBAN)
+
+CLIENT info (in the customer block):
+- client: customer COMPANY name
+- code_client: customer code (CODE CLIENT)
+- adresse_client: customer postal address
+- tva_num: customer fiscal/TVA number from client block only
+
+INVOICE METADATA:
+- numero_facture: invoice number
+- date: invoice date in DD/MM/YYYY format
+- mode_paiement: payment method
+
+TOTALS:
+- total_ht: subtotal before tax
+- remise: discount amount in dinars ("" if shown only as percentage)
+- tva: TAX AMOUNT in dinars (NEVER the percentage rate like 19%)
+- timbre: stamp duty, usually "1,000"
+- total_ttc: grand total (NET A PAYER, Total TTC)
+- montant_lettres: amount written in words
+
+LINE ITEMS — four parallel lists of equal length:
+- designation[]: product description
 - quantite[]: quantity
-- prix_unit[]: unit price (PUHT column)
-- montant_ht[]: line total (Mnt HT column)
-EXCLUDE from line items: rows that are BL numbers, Bon de livraison, Commande, Référence.
+- prix_unit[]: unit price
+- montant_ht[]: line total
 
 CRITICAL RULES:
-1. Output FLAT JSON only. NEVER nest under SUPPLIER/CLIENT/TOTALS/LINE_ITEMS keys.
-2. Comma = decimal separator. "323,500" means 323.5 dinars NOT 323500.
-3. rc_mf comes from supplier header/footer. tva_num comes from client block. Never swap.
-4. "Code Douane" is a customs code — NEVER put it in rc_mf.
-5. tva is always a money amount (dinars), never a percentage like 19%.
-6. Client is the COMPANY name, not the contact person.
-7. If a field is absent or unreadable, use "" — never invent values.
-8. All four line-item lists must have exactly the same number of elements.
-9. Numbers: preserve original comma-decimal format e.g. "14791,850" not "14791.85"."""
+1. FLAT JSON only. No nested objects.
+2. Numbers: comma is decimal separator. "323,500" is 323.5 dinars.
+3. rc_mf comes from supplier footer. tva_num comes from client block. Never swap.
+4. tva is always a money amount, never a percentage.
+5. If absent, return "" not null."""
+
+# ─── Post-processing (v6 pipeline) ───────────────────────────────────────────
+def flatten_nested(data):
+    if not isinstance(data, dict):
+        return data
+    flat = {}
+    nested_keys = {"SUPPLIER", "CLIENT", "TOTALS", "ITEMS", "HEADER",
+                   "supplier", "client_info", "totals", "items", "header",
+                   "line_items", "invoice_details", "INVOICE_METADATA"}
+    for k, v in data.items():
+        if k.upper() in {nk.upper() for nk in nested_keys} and isinstance(v, dict):
+            flat.update(v)
+        else:
+            flat[k] = v
+    # Handle line items as list of dicts
+    items = (flat.pop("LINE_ITEMS", None) or flat.pop("line_items", None)
+             or flat.pop("LineItems", None))
+    if isinstance(items, list) and items and isinstance(items[0], dict):
+        flat["designation"] = [str(it.get("designation", "")) for it in items]
+        flat["quantite"]    = [str(it.get("quantite", "")) for it in items]
+        flat["prix_unit"]   = [str(it.get("prix_unit", "")) for it in items]
+        flat["montant_ht"]  = [str(it.get("montant_ht", "")) for it in items]
+    return flat
 
 
-def extract(image: Image.Image):
-    msgs = [{"role": "user", "content": [
-        {"type": "image", "image": image},
-        {"type": "text", "text": SCHEMA}
-    ]}]
-    text = processor.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
-    inp = processor(text=[text], images=[image], return_tensors="pt").to(model.device)
-    with torch.no_grad():
-        out = model.generate(**inp, max_new_tokens=2048, do_sample=False)
-    resp = processor.decode(out[0][inp.input_ids.shape[1]:], skip_special_tokens=True)
-    torch.cuda.empty_cache()
+def _to_num(s):
     try:
-        s, e = resp.find("{"), resp.rfind("}") + 1
-        return json.loads(resp[s:e])
+        return float(str(s).replace(",", ".").replace(" ", "").replace("\u00a0", ""))
     except Exception:
         return None
 
 
-def flatten_nested(p):
-    if not isinstance(p, dict):
-        return p
-    flat = {}
-    for k, v in p.items():
-        if isinstance(v, dict):
-            for k2, v2 in v.items():
-                flat[k2] = v2
-        else:
-            flat[k] = v
-    items = (flat.pop("LINE_ITEMS", None) or flat.pop("line_items", None) or flat.pop("LineItems", None))
-    if isinstance(items, list) and items and isinstance(items[0], dict):
-        flat["designation"] = [str(it.get("designation", "")) for it in items]
-        flat["quantite"] = [str(it.get("quantite", "")) for it in items]
-        flat["prix_unit"] = [str(it.get("prix_unit", "")) for it in items]
-        flat["montant_ht"] = [str(it.get("montant_ht", "")) for it in items]
-    return flat
-
-
-REF_ROW = re.compile(
-    r"^(bon\s+de\s+livraison|commande|cd\s*\d+|bl\s*\d+|b\d{4,}|r[ée]f[ée]rence|devis)",
-    re.IGNORECASE,
-)
-
-
-def _safe_norm_num(v):
-    if v is None or v == "":
-        return v
-    s = str(v).strip()
-    cleaned = s.replace(" ", "").replace("\u00a0", "")
-    if "," in cleaned and "." in cleaned:
-        if cleaned.rfind(",") > cleaned.rfind("."):
-            cleaned = cleaned.replace(".", "").replace(",", ".")
-        else:
-            cleaned = cleaned.replace(",", "")
-    elif "," in cleaned:
-        parts = cleaned.split(",")
-        if len(parts) == 2 and len(parts[1]) <= 3:
-            cleaned = cleaned.replace(",", ".")
-        else:
-            cleaned = cleaned.replace(",", "")
-    try:
-        float(cleaned)
-        return cleaned
-    except ValueError:
-        return s
-
-
-def post_process(p):
-    if not isinstance(p, dict):
-        return p
-    for field in ("total_ht", "remise", "tva", "timbre", "total_ttc"):
-        if field in p and not isinstance(p[field], list):
-            p[field] = _safe_norm_num(p[field])
-    for field in ("prix_unit", "montant_ht", "quantite"):
-        if isinstance(p.get(field), list):
-            p[field] = [_safe_norm_num(x) for x in p[field]]
-    if p.get("telephone"):
-        p["telephone"] = re.split(r"\s+[A-Za-zÀ-ÿ]", str(p["telephone"]))[0].strip()
-    if isinstance(p.get("designation"), list):
-        keep = [i for i, d in enumerate(p["designation"]) if not REF_ROW.match(str(d).strip())]
-        for field in ("designation", "quantite", "prix_unit", "montant_ht"):
-            if isinstance(p.get(field), list):
-                p[field] = [p[field][i] for i in keep if i < len(p[field])]
-    return p
-
-
-def _to_float(v):
-    if v is None or v == "":
-        return None
-    try:
-        return float(str(v).replace(",", ".").replace(" ", ""))
-    except ValueError:
-        return None
-
-
-def validate(p):
+def validate(data):
     issues = []
-    for f in ("client", "numero_facture", "date", "total_ttc"):
-        if not p.get(f):
-            issues.append(f"missing critical field: {f}")
-    ht = _to_float(p.get("total_ht"))
-    rem = _to_float(p.get("remise")) or 0.0
-    tva = _to_float(p.get("tva"))
-    tmb = _to_float(p.get("timbre")) or 0.0
-    ttc = _to_float(p.get("total_ttc"))
-    if ht and tva and ttc:
-        expected = ht - rem + tva + tmb
+    ht  = _to_num(data.get("total_ht"))
+    rem = _to_num(data.get("remise")) or 0
+    tva = _to_num(data.get("tva")) or 0
+    tim = _to_num(data.get("timbre")) or 0
+    ttc = _to_num(data.get("total_ttc"))
+
+    if ht is not None and ttc is not None:
+        expected = ht - rem + tva + tim
         if abs(expected - ttc) > 1.0:
-            issues.append(f"math mismatch: {ht}-{rem}+{tva}+{tmb}={expected:.3f} ≠ ttc={ttc}")
-    for label, val in [("total_ht", ht), ("total_ttc", ttc), ("tva", tva)]:
-        if val and val >= 1_000_000:
-            issues.append(f"magnitude suspect: {label}={val} (≥1M, likely 1000x misread)")
-    if tmb and tmb >= 100:
-        issues.append(f"timbre={tmb} suspicious (≥100)")
-    rc, tn = (p.get("rc_mf") or "").strip(), (p.get("tva_num") or "").strip()
+            issues.append(f"math_mismatch: {ht}-{rem}+{tva}+{tim}={expected:.3f} != ttc={ttc}")
+
+    suspicious = [v for v in (ht, ttc) if v is not None and v >= 1_000_000]
+    if suspicious or (tim and tim >= 100):
+        issues.append(f"magnitude_error: ht={ht}, ttc={ttc}, timbre={tim}")
+
+    date = data.get("date", "")
+    if date and not re.match(r"\d{2}/\d{2}/\d{4}$", str(date)):
+        issues.append(f"date_format: '{date}'")
+
+    for f in ("client", "numero_facture", "date", "total_ttc"):
+        if not data.get(f):
+            issues.append(f"missing: {f}")
+
+    rc = (data.get("rc_mf") or "").strip()
+    tn = (data.get("tva_num") or "").strip()
     if rc and tn and rc == tn:
-        issues.append("rc_mf identical to tva_num — likely a swap")
-    if tva and ttc and abs(tva - ttc) < 1.0:
-        issues.append(f"tva ({tva}) equals total_ttc ({ttc}) — likely misread")
-    if tva and ht and tva > ht:
-        issues.append(f"tva ({tva}) > total_ht ({ht}) — suspicious")
-    lens = [len(p.get(f, [])) for f in ("designation", "quantite", "prix_unit", "montant_ht")]
+        issues.append("rc_mf identical to tva_num — likely swapped")
+
+    lens = [len(data.get(f, [])) for f in ("designation", "quantite", "prix_unit", "montant_ht")
+            if isinstance(data.get(f), list)]
     if len(set(lens)) > 1:
-        issues.append(f"line-item list lengths mismatch: {lens}")
-    return (len(issues) == 0), issues
+        issues.append(f"line_item_length_mismatch: {lens}")
+
+    return len(issues) == 0, issues
 
 
-def process_invoice(image):
-    raw = extract(image)
-    if raw is None:
-        return {"data": {}, "auto_accept": False, "issues": ["extraction_failed: could not parse JSON"]}
-    raw = flatten_nested(raw)
-    cleaned = post_process(raw)
-    ok, issues = validate(cleaned)
-    return {"data": cleaned, "auto_accept": ok, "issues": issues}
+# ─── Inference ───────────────────────────────────────────────────────────────
+def run_inference(image: Image.Image) -> str:
+    msgs = [{"role": "user", "content": [
+        {"type": "image", "image": image},
+        {"type": "text",  "text": SCHEMA}
+    ]}]
+    text = processor.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
+    inputs = processor(text=[text], images=[image], return_tensors="pt").to(model.device)
+    with torch.no_grad():
+        out = model.generate(**inputs, max_new_tokens=2048, do_sample=False)
+    response = processor.decode(out[0][inputs.input_ids.shape[1]:], skip_special_tokens=True)
+    torch.cuda.empty_cache()
+    return response
 
 
-def handler(job):
+def process_invoice(image: Image.Image) -> dict:
+    raw_text = run_inference(image)
+
+    # Parse JSON from response
+    text = raw_text.strip()
+    text = re.sub(r"^```(?:json)?\s*", "", text)
+    text = re.sub(r"\s*```$", "", text)
+    s, e = text.find("{"), text.rfind("}") + 1
+    if s < 0 or e <= s:
+        return {"error": "no_json_found", "raw": raw_text[:500]}
+
     try:
-        job_input = job.get("input", {})
-        image_b64 = job_input.get("image_base64")
-        if not image_b64:
-            return {"error": "Missing 'image_base64' in input"}
-        image = Image.open(BytesIO(base64.b64decode(image_b64))).convert("RGB")
-        return process_invoice(image)
-    except Exception as e:
+        data = json.loads(text[s:e])
+    except json.JSONDecodeError as ex:
+        return {"error": f"json_parse_failed: {ex}", "raw": raw_text[:500]}
+
+    data = flatten_nested(data)
+    auto_accept, issues = validate(data)
+    return {"data": data, "auto_accept": auto_accept, "issues": issues}
+
+
+# ─── RunPod handler ──────────────────────────────────────────────────────────
+def handler(job):
+    if LOAD_ERROR:
+        return {"error": f"model_not_loaded: {LOAD_ERROR[:300]}"}
+
+    job_input = job.get("input", {})
+
+    # Accept base64 image
+    image_b64 = job_input.get("image_base64") or job_input.get("image")
+    if not image_b64:
+        return {"error": "missing image_base64 in input"}
+
+    try:
+        image_bytes = base64.b64decode(image_b64)
+        image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    except Exception as ex:
+        return {"error": f"image_decode_failed: {ex}"}
+
+    # Resize if needed
+    w, h = image.size
+    if max(w, h) > 1600:
+        ratio = 1600 / max(w, h)
+        image = image.resize((int(w * ratio), int(h * ratio)), Image.LANCZOS)
+
+    try:
+        result = process_invoice(image)
+    except Exception:
         return {"error": traceback.format_exc()}
+
+    return result
 
 
 runpod.serverless.start({"handler": handler})
